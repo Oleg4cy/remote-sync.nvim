@@ -8,6 +8,7 @@ local SUPPORTED_OPTIONS = {
   max_output_bytes = true,
   on_stdout = true,
   on_stderr = true,
+  stdin = true,
 }
 
 local function valid_array(argv)
@@ -168,8 +169,14 @@ function M.run(argv, opts, on_exit)
     end
   end
 
+  local stdin = opts and opts.stdin
+  if stdin ~= nil and type(stdin) ~= "string" then
+    return nil, "stdin must be a string"
+  end
+
   local system_opts = {
     text = true,
+    stdin = stdin,
     stdout = handle_stdout,
     stderr = handle_stderr,
   }
