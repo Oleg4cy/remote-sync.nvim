@@ -209,4 +209,203 @@ local exit_count = 0
 runner.run({ "cmd" }, {}, function() exit_count = exit_count + 1; error("exit failure") end); calls[#calls].on_exit({ code = 1, signal = 2 }); equal(exit_count, 1)
 system_error = "system failure"; local value, err = no_throw(function() return runner.run({ "cmd" }, {}) end); equal(value, nil); nonempty_string(err); equal(exit_count, 1)
 
+-- 4.8.2a: standalone coverage for the production operations module.
+do
+  local vim_ref = _G.vim
+  local old_expand = vim_ref.fn.expand
+  local old_fnamemodify = vim_ref.fn.fnamemodify
+  local old_config = package.loaded["remote-sync.config"]
+  local old_runner = package.loaded["remote-sync.runner"]
+
+  local calls = {}
+  local detected_paths = {}
+  local fake_process = {}
+  local detect_result = {
+    root = "/project",
+    host = "deploy@example.com",
+    remote = "/var/www/project",
+  }
+  local runner_result = fake_process
+  local runner_error
+
+  local fake_config = {
+    detect_project = function(file_path)
+      detected_paths[#detected_paths + 1] = file_path
+      return detect_result
+    end,
+  }
+  local fake_runner = {
+    run = function(argv, opts, on_exit)
+      calls[#calls + 1] = { argv = argv, opts = opts, on_exit = on_exit }
+      return runner_result, runner_error
+    end,
+  }
+
+  local function reset(result)
+    calls = {}
+    detected_paths = {}
+    detect_result = result or {
+      root = "/project",
+      host = "deploy@example.com",
+      remote = "/var/www/project",
+    }
+    runner_result = fake_process
+    runner_error = nil
+  end
+
+  local function array_equal(actual, expected)
+    assert(#actual == #expected, "argv length mismatch")
+    for i = 1, #expected do
+      assert(actual[i] == expected[i], "argv item mismatch at " .. i)
+    end
+  end
+
+  local function no_unexpected_opts(opts, expected)
+    for key in pairs(opts) do
+      assert(expected[key], "unexpected runner option: " .. key)
+    end
+  end
+
+  local function rejected(call, message)
+    local ok, a, b = pcall(call)
+    assert(ok, message .. " threw")
+    assert(a == nil and type(b) == "string" and b ~= "", message .. " was not rejected")
+  end
+
+  local function assert_not_called(message)
+    assert(#calls == 0, message .. " called runner")
+    assert(#detected_paths == 0, message .. " called config")
+  end
+
+  vim_ref.fn.expand = function(path) return path end
+  vim_ref.fn.fnamemodify = function(path, modifier)
+    assert(modifier == ":p")
+    if path == "/" then return path end
+    return (path:gsub("/+$", ""))
+  end
+
+  package.loaded["remote-sync.config"] = fake_config
+  package.loaded["remote-sync.runner"] = fake_runner
+  package.loaded["remote-sync.operations"] = nil
+  local operations = require("remote-sync.operations")
+
+  local stdout_cb = function() end
+  local stderr_cb = function() end
+  local exit_cb = function() end
+  reset()
+  local process = operations.upload("/project/dir/file.php", {
+    on_stdout = stdout_cb, on_stderr = stderr_cb, on_exit = exit_cb,
+  })
+  assert(process == fake_process)
+  assert(detected_paths[1] == "/project/dir/file.php")
+  array_equal(calls[1].argv, {
+    "rsync", "-rzv", "--itemize-changes", "--relative", "--compress-level=0",
+    "--no-perms", "--no-owner", "--no-group", "--omit-dir-times", "-e",
+    "ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o Compression=no -o ControlMaster=auto -o ControlPersist=30s -o ControlPath=~/.ssh/cm-%C",
+    "./dir/file.php", "deploy@example.com:/var/www/project",
+  })
+  assert(calls[1].opts.cwd == "/project")
+  assert(calls[1].opts.on_stdout == stdout_cb and calls[1].opts.on_stderr == stderr_cb)
+  assert(calls[1].opts.on_exit == nil and calls[1].on_exit == exit_cb)
+  no_unexpected_opts(calls[1].opts, { cwd = true, on_stdout = true, on_stderr = true })
+
+  reset(); runner_result, runner_error = nil, "start failure"
+  local upload_process, upload_error = operations.upload("/project/dir/file.php", nil)
+  assert(upload_process == nil and upload_error == "start failure")
+
+  reset(); runner_result, runner_error = nil, "download start failure"
+  local download_process, download_error = operations.download("/project/dir/file.php", nil)
+  assert(download_process == nil and download_error == "download start failure")
+
+  reset({ root = "/", host = "root-host", remote = "/remote" })
+  operations.upload("/dir/file.php", nil)
+  array_equal(calls[1].argv, {
+    "rsync", "-rzv", "--itemize-changes", "--relative", "--compress-level=0",
+    "--no-perms", "--no-owner", "--no-group", "--omit-dir-times", "-e",
+    "ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o Compression=no -o ControlMaster=auto -o ControlPersist=30s -o ControlPath=~/.ssh/cm-%C",
+    "./dir/file.php", "root-host:/remote",
+  })
+  assert(calls[1].opts.cwd == "/")
+
+  reset()
+  process = operations.download("/project/dir/file.php", {
+    on_stdout = stdout_cb, on_stderr = stderr_cb, on_exit = exit_cb,
+  })
+  assert(process == fake_process)
+  array_equal(calls[1].argv, {
+    "rsync", "-az", "--compress-level=0", "-e",
+    "ssh -T -o Compression=no -o ControlMaster=auto -o ControlPersist=30s -o ControlPath=~/.ssh/cm-%C",
+    "deploy@example.com:/var/www/project/dir/file.php", "/project/dir/file.php",
+  })
+  assert(not calls[1].argv[5]:find("BatchMode=yes", 1, true))
+  assert(not calls[1].argv[5]:find("ConnectTimeout=10", 1, true))
+  assert(calls[1].opts.on_stdout == stdout_cb and calls[1].opts.on_stderr == stderr_cb)
+  assert(calls[1].opts.cwd == nil and calls[1].opts.on_exit == nil and calls[1].on_exit == exit_cb)
+  no_unexpected_opts(calls[1].opts, { on_stdout = true, on_stderr = true })
+
+  reset({ root = "/project", host = "deploy@example.com", remote = "/" })
+  operations.download("/project/dir/file.php", nil)
+  assert(calls[1].argv[6] == "deploy@example.com:/dir/file.php")
+  reset({ root = "/", host = "root-host", remote = "/remote" })
+  operations.download("/dir/file.php", nil)
+  assert(calls[1].argv[6] == "root-host:/remote/dir/file.php" and calls[1].argv[7] == "/dir/file.php")
+
+  reset({ root = "/project/", host = "host", remote = "/remote" })
+  operations.upload("/project/dir/file.php", nil)
+  assert(calls[1].argv[12] == "./dir/file.php" and calls[1].opts.cwd == "/project/")
+
+  reset()
+  rejected(function() return operations.upload(nil, nil) end, "nil upload path")
+  assert_not_called("nil upload path")
+  reset()
+  rejected(function() return operations.download(nil, nil) end, "nil download path")
+  assert_not_called("nil download path")
+
+  local invalid_paths = { false, 123, {}, "", "   " }
+  for _, path in ipairs(invalid_paths) do
+    reset()
+    rejected(function() return operations.upload(path, nil) end, "invalid upload path")
+    assert_not_called("invalid upload path")
+    reset()
+    rejected(function() return operations.download(path, nil) end, "invalid download path")
+    assert_not_called("invalid download path")
+  end
+
+  local invalid_opts = {
+    false, "bad", { unknown = true }, { on_stdout = true },
+    { on_stderr = "bad" }, { on_exit = 123 },
+  }
+  for _, opts in ipairs(invalid_opts) do
+    reset(); rejected(function() return operations.upload("/project/file.php", opts) end, "invalid upload opts"); assert_not_called("invalid upload opts")
+    reset(); rejected(function() return operations.download("/project/file.php", opts) end, "invalid download opts"); assert_not_called("invalid download opts")
+  end
+
+  reset(); detect_result = nil
+  local result, err = operations.upload("/project/file.php", nil)
+  assert(result == nil and err == "project not found"); assert(#calls == 0)
+  reset(); detect_result = nil
+  result, err = operations.download("/project/file.php", nil)
+  assert(result == nil and err == "project not found"); assert(#calls == 0)
+
+for _, method in ipairs({ "upload", "download" }) do
+  reset({ root = "/different-project", host = "host", remote = "/remote" })
+  rejected(function() return operations[method]("/project/file.php", nil) end, "outside project root")
+  assert(#calls == 0, "outside project root called runner")
+  assert(#detected_paths == 1, "outside project root config call count mismatch")
+  assert(detected_paths[1] == "/project/file.php", "outside project root config path mismatch")
+
+  reset({ root = "/project", host = "host", remote = "/remote" })
+  rejected(function() return operations[method]("/project", nil) end, "project root file")
+  assert(#calls == 0, "project root file called runner")
+  assert(#detected_paths == 1, "project root file config call count mismatch")
+  assert(detected_paths[1] == "/project", "project root file config path mismatch")
+end
+
+  package.loaded["remote-sync.operations"] = nil
+  package.loaded["remote-sync.config"] = old_config
+  package.loaded["remote-sync.runner"] = old_runner
+  vim_ref.fn.expand = old_expand
+  vim_ref.fn.fnamemodify = old_fnamemodify
+end
+
 print("remote-sync tests: OK")
