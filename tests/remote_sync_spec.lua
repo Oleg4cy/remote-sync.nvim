@@ -408,4 +408,164 @@ end
   vim_ref.fn.fnamemodify = old_fnamemodify
 end
 
+do
+  local saved_config = package.loaded["remote-sync.config"]
+  local saved_runner = package.loaded["remote-sync.runner"]
+  local saved_git = package.loaded["remote-sync.git"]
+  local saved_uv = vim.uv
+
+  local existing = {}
+  local stat_paths = {}
+  local detected = {}
+  local calls = {}
+  local project = { root = "/project", host = "deploy@example.com", remote = "/var/www/project" }
+  local git_process = {}
+  local rsync_process = {}
+  local public_stdout = function() end
+  local public_stderr = function() end
+  local public_exit = function() end
+
+  vim.uv = {
+    fs_stat = function(path)
+      stat_paths[#stat_paths + 1] = path
+      if existing[path] then return { type = "file" } end
+      return nil
+    end,
+  }
+
+  local fake_config = {
+    detect_project = function(file_path)
+      detected[#detected + 1] = file_path
+      return project
+    end,
+  }
+  local fake_runner = {
+    run = function(argv, opts, on_exit)
+      calls[#calls + 1] = { argv = argv, opts = opts, on_exit = on_exit }
+      if #calls == 1 then return git_process end
+      return rsync_process
+    end,
+  }
+  package.loaded["remote-sync.config"] = fake_config
+  package.loaded["remote-sync.runner"] = fake_runner
+  package.loaded["remote-sync.git"] = nil
+  local git = require("remote-sync.git")
+
+  local function success_result()
+    return {
+      code = 0, signal = 0, stdout = "", stderr = "",
+      stdout_truncated = false, stderr_truncated = false,
+      stdout_error = nil, stderr_error = nil,
+      stdout_callback_error = nil, stderr_callback_error = nil,
+    }
+  end
+
+  local function reset(root, host, remote, paths)
+    calls, detected, stat_paths = {}, {}, {}
+    existing = {}
+    for _, path in ipairs(paths or {}) do existing[path] = true end
+    project = { root = root or "/project", host = host or "deploy@example.com", remote = remote or "/var/www/project" }
+    git_process, rsync_process = {}, {}
+  end
+
+  local function eq(actual, expected)
+    assert(actual == expected, "expected " .. tostring(expected) .. ", got " .. tostring(actual))
+  end
+  local function argv_eq(actual, expected)
+    eq(#actual, #expected)
+    for i = 1, #expected do eq(actual[i], expected[i]) end
+  end
+  local function upload(stream, opts, chunks)
+    local process = git.upload("/project/current.php", opts or {
+      on_stdout = public_stdout, on_stderr = public_stderr, on_exit = public_exit,
+    })
+    eq(process, git_process)
+    local first = calls[1]
+    if chunks then
+      for _, chunk in ipairs(chunks) do first.opts.on_stdout(chunk) end
+    else
+      first.opts.on_stdout(stream)
+    end
+    first.on_exit(success_result())
+    eq(#calls, 2)
+    return calls[1], calls[2]
+  end
+
+  reset("/project", "deploy@example.com", "/var/www/project", {
+    "/project/modified.php", "/project/staged.php", "/project/new file.php",
+  })
+  local first, second = upload(" M modified.php\0M  staged.php\0?? new file.php\0")
+  eq(detected[1], "/project/current.php")
+  argv_eq(first.argv, { "git", "status", "--porcelain=v1", "-z", "--untracked-files=all" })
+  eq(first.opts.cwd, "/project")
+  assert(type(first.opts.on_stdout) == "function")
+  assert(first.opts.on_stdout ~= public_stdout)
+  eq(first.opts.on_stderr, public_stderr)
+  assert(type(first.on_exit) == "function")
+  argv_eq(second.argv, {
+    "rsync", "-azv", "--itemize-changes", "--files-from=-", "--from0", "--relative",
+    "--compress-level=0", "-e",
+    "ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o Compression=no -o ControlMaster=auto -o ControlPersist=30s -o ControlPath=~/.ssh/cm-%C",
+    "./", "deploy@example.com:/var/www/project",
+  })
+  eq(second.opts.cwd, "/project")
+  eq(second.opts.stdin, "modified.php\0staged.php\0new file.php\0")
+  eq(second.opts.on_stdout, public_stdout)
+  eq(second.opts.on_stderr, public_stderr)
+  eq(second.on_exit, public_exit)
+  assert(second.opts.on_exit == nil and second.opts.env == nil and second.opts.max_output_bytes == nil)
+
+  reset("/project", "deploy@example.com", "/var/www/project", { "/project/exists.php", "/project/new.php" })
+  _, second = upload(" M exists.php\0 M deleted.php\0?? new.php\0")
+  eq(second.opts.stdin, "exists.php\0new.php\0")
+
+  reset("/", "root-host", "/remote", { "/dir/file.php" })
+  _, second = upload(" M dir/file.php\0")
+  eq(stat_paths[1], "/dir/file.php")
+  assert(stat_paths[1] ~= "//dir/file.php")
+  eq(second.opts.cwd, "/")
+  eq(second.argv[#second.argv], "root-host:/remote")
+
+  reset("/project", "deploy@example.com", "/var/www/project", {})
+  _, second = upload(" M deleted.php\0")
+  eq(second.opts.stdin, "")
+
+  reset("/project", "deploy@example.com", "/var/www/project", { "/project/dup.php" })
+  _, second = upload(" M dup.php\0M  dup.php\0?? dup.php\0")
+  eq(second.opts.stdin, "dup.php\0")
+
+  local names = { "dir/file with spaces.php", "dir/tab\tname.php", "dir/quote\"name.php", "dir/back\\slash.php", "dir/new\nline.php" }
+  local stream, expected = "", ""
+  reset("/project", "deploy@example.com", "/var/www/project", {})
+  for _, name in ipairs(names) do
+    existing["/project/" .. name] = true
+    stream = stream .. " M " .. name .. "\0"
+    expected = expected .. name .. "\0"
+  end
+  _, second = upload(stream)
+  eq(second.opts.stdin, expected)
+
+  reset("/project", "deploy@example.com", "/var/www/project", { "/project/alpha.php", "/project/beta file.php" })
+  _, second = upload(nil, nil, { " M", " alpha", ".php\0?? beta file.php", "\0" })
+  eq(second.opts.stdin, "alpha.php\0beta file.php\0")
+
+  reset("/project", "deploy@example.com", "/var/www/project", { "/project/new/name.php", "/project/new2.php", "/project/copy-new.php", "/project/copy-new2.php" })
+  _, second = upload("R  new/name.php\0old name.php\0 R new2.php\0old2.php\0C  copy-new.php\0copy old.php\0 C copy-new2.php\0copy-old2.php\0")
+  eq(second.opts.stdin, "new/name.php\0new2.php\0copy-new.php\0copy-new2.php\0")
+  assert(not (function()
+    for _, p in ipairs(stat_paths) do if p == "/project/old name.php" then return true end end
+  end)())
+
+  reset("/project", "deploy@example.com", "/var/www/project", {
+    "/project/modified.php", "/project/new/name.php", "/project/new.php", "/project/copy.php", "/project/another.php",
+  })
+  _, second = upload(" M modified.php\0R  new/name.php\0old name.php\0?? new.php\0C  copy.php\0old\\source.php\0 M another.php\0")
+  eq(second.opts.stdin, "modified.php\0new/name.php\0new.php\0copy.php\0another.php\0")
+
+  package.loaded["remote-sync.config"] = saved_config
+  package.loaded["remote-sync.runner"] = saved_runner
+  package.loaded["remote-sync.git"] = saved_git
+  vim.uv = saved_uv
+end
+
 print("remote-sync tests: OK")
