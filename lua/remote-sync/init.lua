@@ -191,6 +191,11 @@ function M.upload(file_path)
   return system
 end
 
+function M.upload_current()
+  vim.cmd("write")
+  return M.upload()
+end
+
 function M.download(file_path)
   local resolved, err = resolve_file_path(file_path)
   if not resolved then
