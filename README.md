@@ -115,6 +115,19 @@ Run:
 :checkhealth remote-sync
 ```
 
+With lazy.nvim and `lazy = true`, the plugin may not yet be in Neovim's runtimepath. If the plugin has not been loaded yet, load it first, then run the healthcheck:
+
+```vim
+:Lazy load remote-sync.nvim
+:checkhealth remote-sync
+```
+
+Using any configured remote-sync command or mapping first will also load the plugin. After that, the healthcheck works normally:
+
+```vim
+:checkhealth remote-sync
+```
+
 The healthcheck performs only local passive checks for `vim.system()` availability, `rsync`, `ssh`, and `git` executable availability, and the current configured-project count. It does not contact remote servers, verify credentials, run rsync, ssh, or git, mutate configuration, or read `config.local`.
 
 ## Tests
