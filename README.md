@@ -1,45 +1,79 @@
 # remote-sync.nvim
 
-`remote-sync.nvim` provides manual, one-shot synchronization between local files and configured remote projects. It does not provide background synchronization, polling, filesystem watchers, automatic `BufWritePost` uploads, deployment orchestration, or remote deletion mirroring.
+Manual-only file synchronization between local projects and remote projects over SSH and rsync. The plugin does not synchronize files implicitly.
 
 ## Features
 
-- Upload one current/local file.
-- Download one remote file to its corresponding local path.
-- Upload current Git modified, staged, and untracked paths in a batch.
-- Launch external commands asynchronously.
-- Select projects from configured local roots using the nearest configured ancestor.
-- Execute external commands with argv lists rather than shell command composition.
-- Manual-only synchronization.
+- Upload and download individual files.
+- Upload the current file after saving it.
+- Batch-upload Git changes.
+- Built-in commands and mappings.
+- Passive health checks.
 
 ## Requirements
 
 - Neovim with `vim.system()` support.
-- `rsync`.
-- `ssh`.
-- `git` only when `git_upload()` is used.
+- `rsync` and `ssh` available in `PATH`.
+- `git` available in `PATH` when `git_upload()` is used.
 
 ## Installation
 
-With [lazy.nvim](https://github.com/folke/lazy.nvim):
+The recommended setup uses an external remote-sync.nvim configuration file:
 
 ```lua
 {
   "Oleg4cy/remote-sync.nvim",
   opts = {
-    projects = {
-      ["/home/user/project"] = {
-        host = "user@example.com",
-        remote = "/var/www/project",
-      },
+    config = "lua/config/remote-sync.lua",
+  },
+}
+```
+
+### External config file
+
+Relative paths are resolved from `vim.fn.stdpath("config")`, not from the current working directory. For example, when:
+
+```lua
+vim.fn.stdpath("config") == "/home/user/.config/nvim"
+```
+
+`config = "lua/config/remote-sync.lua"` resolves to `/home/user/.config/nvim/lua/config/remote-sync.lua`.
+
+The external Lua file is a remote-sync.nvim configuration file loaded directly by the plugin. It must return a table:
+
+```lua
+return {
+  projects = {
+    ["/home/user/project"] = {
+      host = "user@example.com",
+      remote = "/var/www/project",
     },
   },
 }
 ```
 
-The plugin owns its lazy.nvim package metadata and is configured through `opts.projects`. `projects` is the only setup option.
+The table key is the local project root. `host` is the SSH destination, and `remote` is the corresponding remote project root. Nested configured roots use the nearest configured ancestor.
 
-## Configuration
+The file referenced by `opts.config` is loaded directly by remote-sync.nvim. The main Neovim configuration does not need to require it, call `dofile()` or `loadfile()`, inspect `fs_stat()`, extract projects manually, or define machine-specific loading helpers.
+
+The config file must exist, be valid Lua, execute successfully, and return a table. It may contain `projects`, but it must not contain another `config` key or unknown setup keys.
+
+### Absolute config path
+
+Absolute paths are accepted unchanged:
+
+```lua
+{
+  "Oleg4cy/remote-sync.nvim",
+  opts = {
+    config = "/home/user/.config/nvim/remote-sync.lua",
+  },
+}
+```
+
+### Inline configuration
+
+Inline `projects` remain fully supported:
 
 ```lua
 require("remote-sync").setup({
@@ -52,47 +86,62 @@ require("remote-sync").setup({
 })
 ```
 
-`projects` is a Lua table whose key is the local project root. Each value contains `host`, the SSH destination, and `remote`, the corresponding remote project root. If configured roots are nested, the nearest configured ancestor is selected. `projects` is the only setup option. The plugin does not know about `config.local`, `local.lua`, or machine-specific configuration files; loading projects from such files is policy belonging to your main Neovim configuration.
+Choose either inline `projects` or an external `config` file. `projects` and `config` cannot be supplied together.
+
+## Configuration
+
+The setup API accepts exactly these options:
+
+- `projects`: inline project definitions.
+- `config`: a path to an external Lua configuration file.
+
+For example:
+
+```lua
+require("remote-sync").setup({
+  config = "lua/config/remote-sync.lua",
+})
+```
 
 ## Public API
 
 ```lua
-local remote_sync = require("remote-sync")
-
-remote_sync.setup(opts)
-remote_sync.upload(file_path)
-remote_sync.upload_current()
-remote_sync.download(file_path)
-remote_sync.git_upload(file_path)
+require("remote-sync").setup(opts)
+require("remote-sync").upload(file_path)
+require("remote-sync").upload_current()
+require("remote-sync").download(file_path)
+require("remote-sync").git_upload(file_path)
 ```
 
-`upload(file_path)` accepts an optional path; when omitted, it uses the current buffer path. It does not execute `:write`. `upload_current()` takes no path, executes `:write`, then calls `upload()`; if `:write` fails, upload does not start. `download(file_path)` accepts an optional path and otherwise uses the current buffer path; it does not implicitly save the buffer. `git_upload(file_path)` also accepts an optional path and otherwise uses the current buffer path for project detection; it does not implicitly save the buffer.
+`upload(file_path)` accepts an optional path; when omitted, it uses the current buffer path. It does not execute `:write`. `upload_current()` takes no path, executes `:write`, and then calls `upload()`; if `:write` fails, upload does not start. `download(file_path)` accepts an optional path and uses the current buffer path when omitted; it does not implicitly save. `git_upload(file_path)` also accepts an optional path and uses the current buffer path for project detection when omitted; it does not implicitly save.
+
+`upload()` itself does not save; `upload_current()` is the save-and-upload action. After a successful download, the current buffer is reloaded only if the downloaded path is still the current buffer. External commands are launched asynchronously through `vim.system()`. There is no background polling or persistent worker.
 
 ## Built-in commands
 
-- `:SyncUpload` calls `upload()` and does not execute `:write`.
+- `:SyncUpload` calls `upload()`.
 - `:SyncDownload` calls `download()`.
 - `:SyncGitUpload` calls `git_upload()`.
 
-`:SyncUpload` is intentionally different from the default `<leader>ru` mapping, which saves first.
+`:SyncUpload` does not execute `:write`.
 
 ## Built-in mappings
 
-The default mappings are:
+- `<leader>ru` calls `<Plug>(RemoteSyncUpload)`, which calls `upload_current()` and saves the current buffer before uploading it.
+- `<leader>rd` calls `<Plug>(RemoteSyncDownload)`, which calls `download()`.
+- `<leader>rg` calls `<Plug>(RemoteSyncGitUpload)`, which calls `git_upload()`.
 
-- `<leader>ru` → `<Plug>(RemoteSyncUpload)` → `upload_current()`; saves the current buffer and then uploads it;
-- `<leader>rd` → `<Plug>(RemoteSyncDownload)` → `download()`;
-- `<leader>rg` → `<Plug>(RemoteSyncGitUpload)` → `git_upload()`.
-
-An already occupied default left-hand side is left untouched.
+An already occupied original default lhs is not overwritten.
 
 ## Remapping with `<Plug>`
 
-Stable plugin-owned targets are available:
+The stable mapping targets are:
 
 - `<Plug>(RemoteSyncUpload)`
 - `<Plug>(RemoteSyncDownload)`
 - `<Plug>(RemoteSyncGitUpload)`
+
+The built-in mappings use `hasmapto()` replacement semantics: define a mapping to the corresponding `<Plug>` target and the built-in mapping is not installed for that action.
 
 For example:
 
@@ -105,40 +154,30 @@ vim.keymap.set(
 )
 ```
 
-Because the plugin checks `hasmapto()` before creating defaults, defining this mapping before `VimEnter` means `<leader>ru` is not created. This is a true replacement, not an alias. The decision is independent for Upload, Download, and GitUpload. An already occupied original left-hand side is not overwritten.
-
-`upload()` itself does not save the current buffer. `upload_current()` performs the save-and-upload action. `download()` and `git_upload()` do not implicitly save the current buffer. After a successful download, the current buffer is reloaded only if the downloaded path is still the current buffer. External processes are launched asynchronously through `vim.system()`; the plugin does not perform background polling or use persistent workers.
+The plugin checks `hasmapto()` before installing each original default. If this mapping is defined before `VimEnter`, `<leader>ru` is not created. This is a true replacement, not an alias. Upload, Download, and GitUpload are handled independently.
 
 ## Git batch behavior
 
-`git_upload()` uses:
+Git batch upload uses:
 
 ```text
 git status --porcelain=v1 -z --untracked-files=all
 ```
 
-Current existing paths are uploaded through `rsync`. Modified, staged, and untracked paths are included. Locally deleted paths are skipped. For rename/copy records, the current/destination path is uploaded; the old/source path is not remotely deleted. Remote deletion is not performed. This is not a mirror or deployment system.
+Modified paths, staged paths, and untracked paths are included. Locally deleted paths are skipped. For renames and copies, the destination/current path is uploaded; the old/source path is not remotely deleted. No remote deletion is performed. This is not a mirror or deployment system.
 
 ## Healthcheck
 
-The healthcheck performs only passive local checks for:
-
-- `vim.system()` availability;
-- `rsync` executable availability;
-- `ssh` executable availability;
-- `git` executable availability;
-- configured-project count.
-
-It does not contact remote servers, verify credentials, execute `rsync`, execute `ssh`, execute `git`, mutate configuration, or read `config.local`.
-
-With lazy.nvim, if the plugin has not been loaded yet, run:
+Run:
 
 ```vim
 :Lazy load remote-sync.nvim
 :checkhealth remote-sync
 ```
 
-Using a remote-sync command or mapping first also loads the plugin, after which `:checkhealth remote-sync` works normally. The checkhealth report is not available before the lazy plugin enters `runtimepath`.
+The healthcheck performs passive checks for `vim.system()`, `rsync`, `ssh`, `git`, and the configured project count. It does not contact remote servers, verify credentials, execute rsync, execute ssh, execute git, mutate configuration, or read arbitrary configuration files beyond already configured runtime state.
+
+Using any configured remote-sync command or mapping first loads the plugin. After that, `:checkhealth remote-sync` works normally. The healthcheck does not discover the plugin before the lazy plugin is present in `runtimepath`.
 
 ## Tests
 
