@@ -880,4 +880,282 @@ package.loaded["remote-sync.runner"] = saved_runner
 package.loaded["remote-sync.git"] = saved_git
 end
 
+-- 4.8.3a: standalone tests for the public remote-sync API.
+do
+  local saved_config = package.loaded["remote-sync.config"]
+  local saved_operations = package.loaded["remote-sync.operations"]
+  local saved_git = package.loaded["remote-sync.git"]
+  local saved_init = package.loaded["remote-sync.init"]
+
+  package.loaded["remote-sync.config"] = nil
+  package.loaded["remote-sync.operations"] = nil
+  package.loaded["remote-sync.git"] = nil
+  package.loaded["remote-sync.init"] = nil
+
+  local notifications = {}
+  local scheduled = {}
+  local echoes = {}
+  local cmd_calls = {}
+  local current_buffer_path = "/project/current.php"
+
+  local fake_vim = {
+    log = { levels = { ERROR = "ERROR", INFO = "INFO" } },
+    fn = {},
+    api = {},
+  }
+
+  fake_vim.fn.expand = function(path)
+    if path == "%:p" then
+      return current_buffer_path
+    end
+    return path
+  end
+
+  fake_vim.fn.fnamemodify = function(path, modifier)
+    assert(modifier == ":p")
+    if path:sub(1, 1) == "/" then
+      return path:gsub("/+$", "")
+    end
+    return path
+  end
+
+  fake_vim.notify = function(message, level, opts)
+    notifications[#notifications + 1] = { message = message, level = level, opts = opts }
+  end
+  fake_vim.schedule = function(fn)
+    scheduled[#scheduled + 1] = fn
+  end
+  fake_vim.api.nvim_echo = function(chunks, history, opts)
+    echoes[#echoes + 1] = {
+      line = chunks[1][1],
+      highlight = chunks[1][2],
+      history = history,
+      opts = opts,
+    }
+  end
+  fake_vim.cmd = function(command)
+    cmd_calls[#cmd_calls + 1] = command
+  end
+
+  local function flush_scheduled()
+    while #scheduled > 0 do
+      local fn = table.remove(scheduled, 1)
+      fn()
+    end
+  end
+
+  local upload_process, download_process, git_process = {}, {}, {}
+  local upload_calls, download_calls, git_calls = {}, {}, {}
+  local upload_result, download_result, git_result = upload_process, download_process, git_process
+
+local function clear_array(values)
+  for index = #values, 1, -1 do
+    values[index] = nil
+  end
+end
+
+local function reset_state()
+    notifications = {}
+    scheduled = {}
+    echoes = {}
+    cmd_calls = {}
+  clear_array(upload_calls)
+  clear_array(download_calls)
+  clear_array(git_calls)
+    upload_result = upload_process
+    download_result = download_process
+    git_result = git_process
+  end
+
+  local remote_sync = load_with_fake_vim(repo_file("lua/remote-sync/init.lua"), fake_vim)
+
+  local public_keys = {}
+  for key in pairs(remote_sync) do
+    public_keys[key] = true
+  end
+  assert(public_keys.setup and public_keys.upload and public_keys.download and public_keys.git_upload)
+  local public_key_count = 0
+  for _ in pairs(public_keys) do public_key_count = public_key_count + 1 end
+  assert(public_key_count == 4)
+  assert(type(remote_sync.setup) == "function")
+  assert(type(remote_sync.upload) == "function")
+  assert(type(remote_sync.download) == "function")
+  assert(type(remote_sync.git_upload) == "function")
+  assert(package.loaded["remote-sync.config"] == nil)
+  assert(package.loaded["remote-sync.operations"] == nil)
+  assert(package.loaded["remote-sync.git"] == nil)
+
+  local set_projects_calls = {}
+  local config_failure
+  package.loaded["remote-sync.config"] = {
+    set_projects = function(projects)
+      set_projects_calls[#set_projects_calls + 1] = projects
+      if config_failure then return nil, config_failure end
+      return true
+    end,
+  }
+
+  local function assert_no_ui()
+    assert(#notifications == 0)
+    assert(#scheduled == 0)
+  end
+  local function assert_notification(index, message, level)
+    local notification = notifications[index]
+    assert(notification and notification.message == message)
+    assert(notification.level == level)
+    assert(notification.opts and notification.opts.title == "remote-sync")
+  end
+  local function assert_no_echo(line)
+    for _, echo in ipairs(echoes) do assert(echo.line ~= line) end
+  end
+  local function assert_callbacks(callbacks)
+    assert(type(callbacks) == "table")
+    assert(type(callbacks.on_stdout) == "function")
+    assert(type(callbacks.on_stderr) == "function")
+    assert(type(callbacks.on_exit) == "function")
+  end
+
+  assert(remote_sync.setup(nil) == true)
+  assert(#set_projects_calls == 1 and type(set_projects_calls[1]) == "table")
+  assert(next(set_projects_calls[1]) == nil)
+  assert_no_ui()
+
+  set_projects_calls = {}
+  assert(remote_sync.setup({}) == true)
+  assert(#set_projects_calls == 1 and next(set_projects_calls[1]) == nil)
+
+  local projects = { ["/project"] = { host = "host", remote = "/remote" } }
+  set_projects_calls = {}
+  assert(remote_sync.setup({ projects = projects }) == true)
+  assert(set_projects_calls[1] == projects)
+
+  for _, value in ipairs({ false, 123, "bad" }) do
+    set_projects_calls = {}
+    reset_state()
+    local result, err = remote_sync.setup(value)
+    assert(result == nil and type(err) == "string" and #err > 0)
+    assert(#set_projects_calls == 0)
+    assert_no_ui()
+  end
+  set_projects_calls = {}
+  reset_state()
+  local result, err = remote_sync.setup({ unknown = true })
+  assert(result == nil and type(err) == "string" and #err > 0)
+  assert(#set_projects_calls == 0)
+  assert_no_ui()
+
+  config_failure = "config failure"
+  set_projects_calls = {}
+  reset_state()
+  result, err = remote_sync.setup({ projects = {} })
+  assert(result == nil and err == "config failure")
+  assert(#set_projects_calls == 1)
+  assert_no_ui()
+  config_failure = nil
+
+  local fake_operations = {
+    upload = function(path, callbacks)
+      upload_calls[#upload_calls + 1] = { file_path = path, opts = callbacks }
+      return upload_result
+    end,
+    download = function(path, callbacks)
+      download_calls[#download_calls + 1] = { file_path = path, opts = callbacks }
+      return download_result
+    end,
+  }
+  local fake_git = {
+    upload = function(path, callbacks)
+      git_calls[#git_calls + 1] = { file_path = path, opts = callbacks }
+      return git_result
+    end,
+  }
+  package.loaded["remote-sync.operations"] = fake_operations
+  package.loaded["remote-sync.git"] = fake_git
+
+  local function start_success(fn, path, calls, process, started)
+    reset_state()
+    local actual = fn(path)
+    assert(actual == process)
+    assert(#calls == 1 and calls[1].file_path == path)
+    assert_callbacks(calls[1].opts)
+    assert(#echoes == 0)
+    assert(#cmd_calls == 0)
+    flush_scheduled()
+    assert(echoes[1] and echoes[1].line == started and echoes[1].highlight == "MoreMsg")
+  end
+
+  start_success(remote_sync.upload, "/project/file.php", upload_calls, upload_process, "Upload started")
+  reset_state(); local process = remote_sync.upload(); assert(process == upload_process and upload_calls[1].file_path == current_buffer_path)
+  start_success(remote_sync.download, "/project/download.php", download_calls, download_process, "Download started")
+  reset_state(); process = remote_sync.download(); assert(process == download_process and download_calls[1].file_path == current_buffer_path)
+  start_success(remote_sync.git_upload, "/project/changed.php", git_calls, git_process, "Git sync started")
+  reset_state(); process = remote_sync.git_upload(); assert(process == git_process and git_calls[1].file_path == current_buffer_path)
+
+  local operation_specs = {
+    { remote_sync.upload, fake_operations, "upload", upload_calls },
+    { remote_sync.download, fake_operations, "download", download_calls },
+    { remote_sync.git_upload, fake_git, "upload", git_calls },
+  }
+  for _, spec in ipairs(operation_specs) do
+    for _, path in ipairs({ false, 123, {} }) do
+      reset_state(); local value, message = spec[1](path)
+      assert(value == nil and message == "file path must be a string")
+      assert_notification(1, message, fake_vim.log.levels.ERROR)
+      assert(#spec[4] == 0)
+    end
+    for _, path in ipairs({ "", "   " }) do
+      reset_state(); local value, message = spec[1](path)
+      assert(value == nil and message == "invalid file path")
+      assert_notification(1, message, fake_vim.log.levels.ERROR)
+      assert(#spec[4] == 0)
+    end
+  end
+  reset_state(); result, err = remote_sync.upload({}); assert(result == nil and err == "file path must be a string")
+  assert_notification(1, err, fake_vim.log.levels.ERROR); assert(#upload_calls == 0)
+  current_buffer_path = ""
+  for _, spec in ipairs(operation_specs) do
+    reset_state(); result, err = spec[1](); assert(result == nil and err == "invalid file path")
+    assert_notification(1, err, fake_vim.log.levels.ERROR); assert(#spec[4] == 0)
+  end
+  current_buffer_path = "/project/current.php"
+
+  reset_state(); assert(remote_sync.download("/project/file.php") == download_process); assert_notification(1, "Download...", fake_vim.log.levels.INFO); flush_scheduled(); assert(echoes[1].line == "Download started")
+  reset_state(); assert(remote_sync.git_upload("/project/file.php") == git_process); assert_notification(1, "Syncing git changes...", fake_vim.log.levels.INFO); flush_scheduled(); assert(echoes[1].line == "Git sync started")
+
+  local error_specs = {
+    { remote_sync.upload, "upload", fake_operations, upload_calls, "Upload", "Upload failed to start: " },
+    { remote_sync.download, "download", fake_operations, download_calls, "Download", "Download failed to start: " },
+    { remote_sync.git_upload, "upload", fake_git, git_calls, "Git sync", "Git sync failed to start: " },
+  }
+  for _, spec in ipairs(error_specs) do
+    for _, start_error in ipairs({ "project not found", "rsync unavailable" }) do
+      reset_state(); spec[3][spec[2]] = function() return nil, start_error end
+      result, err = spec[1]("/project/file.php")
+      local expected = start_error == "project not found" and "Project not found" or spec[5] .. " failed to start: " .. start_error
+      local returned = start_error == "project not found" and start_error or spec[6] .. start_error
+      assert(result == nil and err == returned)
+    if spec[2] == "download" then
+      assert_notification(1, "Download...", fake_vim.log.levels.INFO)
+    elseif spec[5] == "Git sync" then
+      assert_notification(1, "Syncing git changes...", fake_vim.log.levels.INFO)
+    end
+
+    local notification_index =
+      (spec[2] == "download" or spec[5] == "Git sync") and 2 or 1
+    assert_notification(notification_index, expected, fake_vim.log.levels.ERROR)
+    assert(#scheduled == 0, spec[5] .. " start failure scheduled output")
+    assert_no_echo(spec[5] .. " started")
+    end
+  end
+  fake_operations.upload = function() return nil, 123 end
+  reset_state(); result, err = remote_sync.upload("/project/file.php")
+  assert(result == nil and err == "Upload failed to start: 123")
+  assert_notification(1, err, fake_vim.log.levels.ERROR)
+
+  package.loaded["remote-sync.config"] = saved_config
+  package.loaded["remote-sync.operations"] = saved_operations
+  package.loaded["remote-sync.git"] = saved_git
+  package.loaded["remote-sync.init"] = saved_init
+end
+
 print("remote-sync tests: OK")
