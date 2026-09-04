@@ -972,12 +972,13 @@ local function reset_state()
   for key in pairs(remote_sync) do
     public_keys[key] = true
   end
-  assert(public_keys.setup and public_keys.upload and public_keys.download and public_keys.git_upload)
+  assert(public_keys.setup and public_keys.upload and public_keys.upload_current and public_keys.download and public_keys.git_upload)
   local public_key_count = 0
   for _ in pairs(public_keys) do public_key_count = public_key_count + 1 end
-  assert(public_key_count == 4)
+  assert(public_key_count == 5)
   assert(type(remote_sync.setup) == "function")
   assert(type(remote_sync.upload) == "function")
+  assert(type(remote_sync.upload_current) == "function")
   assert(type(remote_sync.download) == "function")
   assert(type(remote_sync.git_upload) == "function")
   assert(package.loaded["remote-sync.config"] == nil)
@@ -1043,6 +1044,15 @@ local function reset_state()
   assert(#set_projects_calls == 0)
   assert_no_ui()
 
+  for _, invalid_options in ipairs({ { keymaps = {} }, { default_mappings = false } }) do
+    set_projects_calls = {}
+    reset_state()
+    result, err = remote_sync.setup(invalid_options)
+    assert(result == nil and err:match("^unknown setup option:"))
+    assert(#set_projects_calls == 0)
+    assert_no_ui()
+  end
+
   config_failure = "config failure"
   set_projects_calls = {}
   reset_state()
@@ -1085,6 +1095,40 @@ local function reset_state()
 
   start_success(remote_sync.upload, "/project/file.php", upload_calls, upload_process, "Upload started")
   reset_state(); local process = remote_sync.upload(); assert(process == upload_process and upload_calls[1].file_path == current_buffer_path)
+  do
+    local events = {}
+    local saved_cmd = fake_vim.cmd
+    fake_vim.cmd = function(command)
+      cmd_calls[#cmd_calls + 1] = command
+      if command == "write" then events[#events + 1] = "write" end
+    end
+    fake_operations.upload = function(path, callbacks)
+      events[#events + 1] = "upload"
+      upload_calls[#upload_calls + 1] = { file_path = path, opts = callbacks }
+      return upload_result
+    end
+    reset_state()
+    assert(remote_sync.upload_current() == upload_process)
+    assert(#cmd_calls == 1 and cmd_calls[1] == "write")
+    assert(events[1] == "write" and events[2] == "upload")
+    assert(#upload_calls == 1 and upload_calls[1].file_path == current_buffer_path)
+    assert(#scheduled == 1)
+
+    local write_error = "write failed"
+    fake_vim.cmd = function(command)
+      if command == "write" then error(write_error, 0) end
+      return saved_cmd(command)
+    end
+    reset_state()
+    local ok, failure = pcall(remote_sync.upload_current)
+    assert(not ok and failure == write_error)
+    assert(#upload_calls == 0 and #notifications == 0 and #scheduled == 0)
+    fake_vim.cmd = saved_cmd
+    fake_operations.upload = function(path, callbacks)
+      upload_calls[#upload_calls + 1] = { file_path = path, opts = callbacks }
+      return upload_result
+    end
+  end
   start_success(remote_sync.download, "/project/download.php", download_calls, download_process, "Download started")
   reset_state(); process = remote_sync.download(); assert(process == download_process and download_calls[1].file_path == current_buffer_path)
   start_success(remote_sync.git_upload, "/project/changed.php", git_calls, git_process, "Git sync started")
@@ -1286,6 +1330,119 @@ local function reset_state()
   package.loaded["remote-sync.operations"] = saved_operations
   package.loaded["remote-sync.git"] = saved_git
   package.loaded["remote-sync.init"] = saved_init
+end
+
+-- 4.8.4: standalone plugin and lazy integration coverage.
+do
+  local saved_remote_sync = package.loaded["remote-sync"]
+  local saved_plugin = package.loaded["remote-sync.plugin"]
+
+  package.loaded["remote-sync"] = nil
+  local commands, plugin_vim = {}, { g = {}, api = {} }
+  plugin_vim.api.nvim_create_user_command = function(name, callback, opts)
+    commands[#commands + 1] = { name = name, callback = callback, opts = opts }
+  end
+  load_with_fake_vim(repo_file("plugin/remote-sync.lua"), plugin_vim)
+  assert(#commands == 3)
+  assert(commands[1].name == "SyncUpload")
+  assert(commands[2].name == "SyncDownload")
+  assert(commands[3].name == "SyncGitUpload")
+  assert(package.loaded["remote-sync"] == nil)
+
+  local action_calls = { upload = 0, upload_current = 0, download = 0, git_upload = 0 }
+  package.loaded["remote-sync"] = {
+    upload = function() action_calls.upload = action_calls.upload + 1 end,
+    upload_current = function() action_calls.upload_current = action_calls.upload_current + 1 end,
+    download = function() action_calls.download = action_calls.download + 1 end,
+    git_upload = function() action_calls.git_upload = action_calls.git_upload + 1 end,
+  }
+  commands[1].callback(); commands[2].callback(); commands[3].callback()
+  assert(action_calls.upload == 1 and action_calls.upload_current == 0)
+  assert(action_calls.download == 1 and action_calls.git_upload == 1)
+  local command_count = #commands
+  load_with_fake_vim(repo_file("plugin/remote-sync.lua"), plugin_vim)
+  assert(plugin_vim.g.loaded_remote_sync == true and #commands == command_count)
+
+  local function lazy_scenario(hasmapto, maparg)
+    package.loaded["remote-sync"] = nil
+    local mappings, autocmds, has_calls, arg_calls = {}, {}, {}, {}
+    local lazy_vim = { fn = {}, api = {} }
+    lazy_vim.keymap = {}
+    lazy_vim.keymap.set = function(mode, lhs, rhs, opts)
+      assert(mode == "n")
+      mappings[#mappings + 1] = { lhs = lhs, rhs = rhs, opts = opts }
+    end
+    lazy_vim.api.nvim_create_autocmd = function(event, opts)
+      autocmds[#autocmds + 1] = { event = event, opts = opts }
+    end
+    lazy_vim.fn.hasmapto = function(plug, mode)
+      assert(mode == "n")
+      has_calls[#has_calls + 1] = plug
+      return hasmapto[plug] or 0
+    end
+    lazy_vim.fn.maparg = function(lhs, mode)
+      assert(mode == "n")
+      arg_calls[#arg_calls + 1] = lhs
+      return maparg[lhs] or ""
+    end
+    local spec = load_with_fake_vim(repo_file("lazy.lua"), lazy_vim)
+    assert(#spec.cmd == 3 and spec.cmd[1] == "SyncUpload" and spec.cmd[2] == "SyncDownload" and spec.cmd[3] == "SyncGitUpload")
+    assert(type(spec.init) == "function")
+    spec.init()
+    assert(package.loaded["remote-sync"] == nil)
+    assert(#mappings == 3)
+    local plugs = {
+      ["<Plug>(RemoteSyncUpload)"] = true,
+      ["<Plug>(RemoteSyncDownload)"] = true,
+      ["<Plug>(RemoteSyncGitUpload)"] = true,
+    }
+    for _, mapping in ipairs(mappings) do
+      assert(plugs[mapping.lhs] and type(mapping.rhs) == "function")
+      assert(mapping.opts.silent == true and mapping.opts.desc:match("^Remote Sync:"))
+    end
+    local seen_defaults = { ["<leader>ru"] = true, ["<leader>rd"] = true, ["<leader>rg"] = true }
+    for _, mapping in ipairs(mappings) do assert(not seen_defaults[mapping.lhs]) end
+    assert(#autocmds == 1 and autocmds[1].event == "VimEnter")
+    assert(autocmds[1].opts.once == true and type(autocmds[1].opts.callback) == "function")
+    assert(#has_calls == 0 and #arg_calls == 0)
+
+    local callbacks = {}
+    for _, mapping in ipairs(mappings) do callbacks[mapping.lhs] = mapping.rhs end
+    local callback_calls = { upload_current = 0, download = 0, git_upload = 0 }
+    package.loaded["remote-sync"] = {
+      upload_current = function() callback_calls.upload_current = callback_calls.upload_current + 1 end,
+      download = function() callback_calls.download = callback_calls.download + 1 end,
+      git_upload = function() callback_calls.git_upload = callback_calls.git_upload + 1 end,
+    }
+    callbacks["<Plug>(RemoteSyncUpload)"]()
+    callbacks["<Plug>(RemoteSyncDownload)"]()
+    callbacks["<Plug>(RemoteSyncGitUpload)"]()
+    assert(callback_calls.upload_current == 1 and callback_calls.download == 1 and callback_calls.git_upload == 1)
+    autocmds[1].opts.callback()
+    return mappings, has_calls, arg_calls
+  end
+
+  local mappings = lazy_scenario({}, {})
+  assert(#mappings == 6)
+  local defaults = { ["<leader>ru"] = "<Plug>(RemoteSyncUpload)", ["<leader>rd"] = "<Plug>(RemoteSyncDownload)", ["<leader>rg"] = "<Plug>(RemoteSyncGitUpload)" }
+  for index = 4, 6 do assert(defaults[mappings[index].lhs] == mappings[index].rhs) end
+
+  mappings = lazy_scenario({ ["<Plug>(RemoteSyncUpload)"] = 1 }, {})
+  assert(#mappings == 5)
+  for _, mapping in ipairs(mappings) do assert(mapping.lhs ~= "<leader>ru") end
+  mappings = lazy_scenario({ ["<Plug>(RemoteSyncDownload)"] = 1 }, {})
+  assert(#mappings == 5)
+  for _, mapping in ipairs(mappings) do assert(mapping.lhs ~= "<leader>rd") end
+
+  mappings = lazy_scenario({}, { ["<leader>ru"] = "existing" })
+  assert(#mappings == 5)
+  for _, mapping in ipairs(mappings) do assert(mapping.lhs ~= "<leader>ru") end
+  mappings = lazy_scenario({}, { ["<leader>rd"] = "existing" })
+  assert(#mappings == 5)
+  for _, mapping in ipairs(mappings) do assert(mapping.lhs ~= "<leader>rd") end
+
+  package.loaded["remote-sync"] = saved_remote_sync
+  package.loaded["remote-sync.plugin"] = saved_plugin
 end
 
 print("remote-sync tests: OK")
