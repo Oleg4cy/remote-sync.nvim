@@ -874,7 +874,6 @@ do
 
   eq(successful_exit_count, 1)
 
-vim.uv.fs_stat = saved_stat
 package.loaded["remote-sync.config"] = saved_config
 package.loaded["remote-sync.runner"] = saved_runner
 package.loaded["remote-sync.git"] = saved_git
@@ -1151,6 +1150,137 @@ local function reset_state()
   reset_state(); result, err = remote_sync.upload("/project/file.php")
   assert(result == nil and err == "Upload failed to start: 123")
   assert_notification(1, err, fake_vim.log.levels.ERROR)
+
+  -- 4.8.3b callback and asynchronous reload coverage.
+  fake_operations.upload = function(path, callbacks)
+    upload_calls[#upload_calls + 1] = { file_path = path, opts = callbacks }
+    return upload_result
+  end
+  fake_operations.download = function(path, callbacks)
+    download_calls[#download_calls + 1] = { file_path = path, opts = callbacks }
+    return download_result
+  end
+  fake_git.upload = function(path, callbacks)
+    git_calls[#git_calls + 1] = { file_path = path, opts = callbacks }
+    return git_result
+  end
+
+  local function operation_result(overrides)
+    local result = { code = 0, signal = 0, stdout = "", stderr = "",
+      stdout_truncated = false, stderr_truncated = false }
+    if overrides then for key, value in pairs(overrides) do result[key] = value end end
+    return result
+  end
+  local function echo_at(index, line, highlight)
+    assert(echoes[index] and echoes[index].line == line and echoes[index].highlight == highlight,
+      "unexpected echo at " .. tostring(index))
+  end
+  local function no_echo(line)
+    for _, item in ipairs(echoes) do assert(item.line ~= line) end
+  end
+  local function upload_callbacks()
+    reset_state()
+    assert(remote_sync.upload("/project/file.php") == upload_process)
+    flush_scheduled(); echoes = {}
+    return upload_calls[1].opts
+  end
+  local function download_callbacks(path)
+    reset_state(); current_buffer_path = path
+    assert(remote_sync.download(path) == download_process)
+    flush_scheduled(); echoes = {}; cmd_calls = {}; scheduled = {}
+    return download_calls[1].opts
+  end
+
+  do
+    local callbacks = upload_callbacks()
+    callbacks.on_stdout("first line\nsecond line"); assert(#echoes == 0); flush_scheduled()
+    assert(#echoes == 2); echo_at(1, "first line", "None"); echo_at(2, "second line", "None")
+    callbacks = upload_callbacks(); callbacks.on_stderr("warning one\nwarning two")
+    assert(#echoes == 0); flush_scheduled(); assert(#echoes == 2)
+    echo_at(1, "warning one", "WarningMsg"); echo_at(2, "warning two", "WarningMsg")
+    callbacks = upload_callbacks(); callbacks.on_stdout("one\r\n\r\ntwo\n\nthree")
+    flush_scheduled(); assert(#echoes == 3); echo_at(1, "one", "None"); echo_at(2, "two", "None"); echo_at(3, "three", "None")
+    callbacks = upload_callbacks(); local ok = pcall(function()
+      callbacks.on_stdout(nil); callbacks.on_stdout(""); callbacks.on_stdout(false)
+      callbacks.on_stderr(nil); callbacks.on_stderr(""); callbacks.on_stderr(false)
+    end)
+    assert(ok and #scheduled == 0 and #echoes == 0)
+    callbacks.on_stdout("par"); callbacks.on_stdout("tial"); flush_scheduled()
+    assert(#echoes == 2); echo_at(1, "par", "None"); echo_at(2, "tial", "None")
+  end
+
+  do
+    local callbacks = upload_callbacks(); callbacks.on_exit(operation_result())
+    assert(#echoes == 0 and #cmd_calls == 0); flush_scheduled(); echo_at(1, "Upload done", "MoreMsg")
+    reset_state(); remote_sync.git_upload("/project/file.php"); flush_scheduled(); echoes = {}
+    git_calls[1].opts.on_exit(operation_result()); flush_scheduled(); echo_at(1, "Git sync done", "MoreMsg"); assert(#cmd_calls == 0)
+    callbacks = download_callbacks("/project/file.php"); current_buffer_path = "/different/file.php"
+    callbacks.on_exit(operation_result())
+    assert(#echoes == 0 and #cmd_calls == 0); flush_scheduled(); echo_at(1, "Download done", "MoreMsg"); assert(#cmd_calls == 0)
+    current_buffer_path = "/project/current.php"
+  end
+
+  local function failed_upload(result, first, last)
+    local callbacks = upload_callbacks(); callbacks.on_exit(result); assert(#echoes == 0); flush_scheduled()
+    echo_at(1, first, "ErrorMsg"); if last then echo_at(2, "Last output: " .. last, "ErrorMsg") end; no_echo("Upload done")
+  end
+  failed_upload(operation_result({ code = 23 }), "Upload error. Exit code: 23")
+  failed_upload({ signal = 0, stdout = "", stderr = "", stdout_truncated = false, stderr_truncated = false }, "Upload error")
+  failed_upload(operation_result({ code = 7, stdout = "stdout first\nstdout last", stderr = "stderr first\nstderr last" }), "Upload error. Exit code: 7", "stderr last")
+  failed_upload(operation_result({ code = 3, stdout = "first\n\nlast" }), "Upload error. Exit code: 3", "last")
+  failed_upload(operation_result({ code = 4, stderr = "first\r\nsecond\r\n" }), "Upload error. Exit code: 4", "second")
+  for field, message in pairs({ stdout_error = "stdout stream failure", stderr_error = "stderr stream failure",
+    stdout_callback_error = "stdout callback failure", stderr_callback_error = "stderr callback failure" }) do
+    failed_upload(operation_result({ [field] = message }), "Upload error. Exit code: 0", message)
+  end
+  failed_upload(operation_result({ stdout_error = "stdout error", stderr_error = "stderr error",
+    stdout_callback_error = "stdout callback error", stderr_callback_error = "stderr callback error" }), "Upload error. Exit code: 0", "stdout error")
+  failed_upload(operation_result({ stderr = "real stderr", stdout = "real stdout", stdout_error = "stream error" }), "Upload error. Exit code: 0", "real stderr")
+  failed_upload(operation_result({ stdout = "real stdout", stdout_error = "stream error" }), "Upload error. Exit code: 0", "real stdout")
+
+  do
+    local callbacks = download_callbacks("/project/file.php")
+    callbacks.on_exit(operation_result({
+      code = 10,
+    }))
+    assert(#echoes == 0)
+    flush_scheduled()
+    echo_at(1, "Download error. Exit code: 10", "ErrorMsg")
+    no_echo("Download done")
+    assert(#cmd_calls == 0)
+
+    reset_state()
+    assert(remote_sync.git_upload("/project/file.php") == git_process)
+    flush_scheduled()
+    echoes = {}
+    scheduled = {}
+    git_calls[1].opts.on_exit(operation_result({
+      code = 11,
+    }))
+    assert(#echoes == 0)
+    flush_scheduled()
+    echo_at(1, "Git sync error. Exit code: 11", "ErrorMsg")
+    no_echo("Git sync done")
+    assert(#cmd_calls == 0)
+  end
+
+  do
+    local in_async_callback = false
+    local expand, fnamemodify, cmd = fake_vim.fn.expand, fake_vim.fn.fnamemodify, fake_vim.cmd
+    fake_vim.fn.expand = function(...) if in_async_callback then error("unsafe editor-state access in async callback", 0) end; return expand(...) end
+    fake_vim.fn.fnamemodify = function(...) if in_async_callback then error("unsafe editor-state access in async callback", 0) end; return fnamemodify(...) end
+    fake_vim.cmd = function(...) if in_async_callback then error("unsafe editor-state access in async callback", 0) end; return cmd(...) end
+    local callbacks = download_callbacks("/project/file.php")
+    in_async_callback = true; local ok, err = pcall(function() callbacks.on_exit(operation_result()) end); in_async_callback = false
+    assert(ok, "download on_exit accessed editor state before scheduling: " .. tostring(err)); assert(#cmd_calls == 0)
+    flush_scheduled(); echo_at(1, "Download done", "MoreMsg"); assert(#cmd_calls == 1 and cmd_calls[1] == "edit!")
+    callbacks = download_callbacks("/project/file.php"); in_async_callback = true; assert(pcall(function() callbacks.on_exit(operation_result()) end)); in_async_callback = false
+    current_buffer_path = "/project/other.php"; flush_scheduled(); echo_at(1, "Download done", "MoreMsg"); assert(#cmd_calls == 0)
+    callbacks = download_callbacks("/project/current.php"); callbacks.on_exit(operation_result({ code = 23, stderr = "download failed" })); flush_scheduled()
+    assert(#cmd_calls == 0); echo_at(1, "Download error. Exit code: 23", "ErrorMsg"); no_echo("Download done")
+    fake_vim.fn.expand, fake_vim.fn.fnamemodify, fake_vim.cmd = expand, fnamemodify, cmd
+    current_buffer_path = "/project/current.php"
+  end
 
   package.loaded["remote-sync.config"] = saved_config
   package.loaded["remote-sync.operations"] = saved_operations
