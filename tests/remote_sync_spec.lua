@@ -568,4 +568,316 @@ do
   vim.uv = saved_uv
 end
 
+do
+  local saved_config = package.loaded["remote-sync.config"]
+  local saved_runner = package.loaded["remote-sync.runner"]
+  local saved_git = package.loaded["remote-sync.git"]
+  local saved_stat = vim.uv.fs_stat
+  local calls, detected, stat_paths = {}, {}, {}
+  local existing = {}
+  local project = {
+    root = "/project",
+    host = "deploy@example.com",
+    remote = "/var/www/project",
+  }
+  local git_process, rsync_process = {}, {}
+  local git
+  local git_start_error, rsync_start_error, project_not_found
+  local exit_count, exit_value
+
+  local function check(value, message)
+    assert(value, message or "assertion failed")
+  end
+  local function eq(actual, expected, message)
+    assert(actual == expected, message or (tostring(actual) .. " ~= " .. tostring(expected)))
+  end
+  local function reset()
+    calls, detected, stat_paths = {}, {}, {}
+    existing, project_not_found = {}, nil
+    git_start_error, rsync_start_error = nil, nil
+    exit_count, exit_value = 0, nil
+  end
+  local function success_result()
+    return {
+      code = 0, signal = 0, stdout = "", stderr = "",
+      stdout_truncated = false, stderr_truncated = false,
+      stdout_error = nil, stderr_error = nil,
+      stdout_callback_error = nil, stderr_callback_error = nil,
+    }
+  end
+  local function public_exit(result)
+    exit_count, exit_value = exit_count + 1, result
+  end
+  local function reject(file_path, opts)
+    reset()
+    local ok, a, b = pcall(git.upload, file_path, opts)
+    check(ok)
+    eq(a, nil)
+    check(type(b) == "string" and b ~= "")
+    eq(#detected, 0)
+    eq(#calls, 0)
+  end
+  local function start(stdout, result, opts)
+    reset()
+    local process = git.upload("/project/current.php", opts or { on_exit = public_exit })
+    eq(process, git_process)
+    eq(#detected, 1)
+    eq(#calls, 1)
+    if stdout then calls[1].opts.on_stdout(stdout) end
+    calls[1].on_exit(result or success_result())
+    return calls[1]
+  end
+  local function parser_failure(stdout, message)
+    local call = start(stdout, success_result())
+    eq(#calls, 1)
+    eq(exit_count, 1)
+    eq(exit_value.stderr, message)
+    return call
+  end
+
+  package.loaded["remote-sync.config"] = {
+    detect_project = function(path)
+      detected[#detected + 1] = path
+      if project_not_found then return nil end
+      return project
+    end,
+  }
+  package.loaded["remote-sync.runner"] = {
+    run = function(argv, opts, on_exit)
+      calls[#calls + 1] = { argv = argv, opts = opts, on_exit = on_exit }
+      if #calls == 1 and git_start_error then return nil, git_start_error end
+      if #calls == 2 and rsync_start_error then return nil, rsync_start_error end
+      return (#calls == 1) and git_process or rsync_process
+    end,
+  }
+  package.loaded["remote-sync.git"] = nil
+  git = require("remote-sync.git")
+  vim.uv.fs_stat = function(path)
+    stat_paths[#stat_paths + 1] = path
+    return existing[path] and { type = "file" } or nil
+  end
+
+  reject(nil, nil)
+  for _, value in ipairs({ false, 123, {}, "", "   " }) do reject(value, nil) end
+  for _, value in ipairs({ false, 123, "bad" }) do reject("/project/current.php", value) end
+  reject("/project/current.php", { unknown = true })
+  reject("/project/current.php", { cwd = "/tmp" })
+  reject("/project/current.php", { on_stdout = true })
+  reject("/project/current.php", { on_stderr = "bad" })
+  reject("/project/current.php", { on_exit = 123 })
+
+  reset()
+  eq(git.upload("/project/current.php", nil), git_process)
+  eq(#detected, 1)
+  eq(#calls, 1)
+
+  reset(); project_not_found = true
+  local ok, value, err = pcall(git.upload, "/project/current.php", nil)
+  check(ok); eq(value, nil); eq(err, "project not found"); eq(#detected, 1)
+  eq(detected[1], "/project/current.php"); eq(#calls, 0)
+
+  reset(); git_start_error = "git start failure"
+  ok, value, err = pcall(git.upload, "/project/current.php", { on_exit = public_exit })
+  check(ok); eq(value, nil); eq(err, "git start failure"); eq(#calls, 1); eq(exit_count, 0)
+
+  local failure = { code = 1, signal = 0, stdout = "", stderr = "git failed",
+    stdout_truncated = false, stderr_truncated = false, stdout_error = nil,
+    stderr_error = nil, stdout_callback_error = nil, stderr_callback_error = nil }
+  start(nil, failure); eq(#calls, 1); eq(exit_value, failure)
+  reset(); local throwing_exit = function() error("public exit failure", 0) end
+  local first = git.upload("/project/current.php", { on_exit = throwing_exit }); eq(first, git_process)
+  calls[1].on_exit(failure); eq(#calls, 1)
+
+  local function stream_failure(field, message)
+    local result = success_result(); result[field] = message
+    start(nil, result)
+    eq(#calls, 1); eq(exit_count, 1); eq(exit_value.code, nil); eq(exit_value.signal, nil)
+    eq(exit_value.stdout, ""); eq(exit_value.stderr, message)
+    eq(exit_value.stdout_truncated, false); eq(exit_value.stderr_truncated, false)
+    eq(exit_value[field], message)
+    for _, key in ipairs({ "stderr_error", "stdout_callback_error", "stderr_callback_error" }) do
+      if key ~= field then eq(exit_value[key], nil) end
+    end
+  end
+  stream_failure("stdout_error", "git stdout read failure")
+  stream_failure("stdout_callback_error", "parser callback failure")
+
+  parser_failure("M\0", "malformed git status record")
+  parser_failure(" Mxfile.php\0", "malformed git status record")
+  parser_failure("\0", "malformed git status record")
+  parser_failure(" M incomplete.php", "incomplete git status record")
+  reset(); local partial = git.upload("/project/current.php", { on_exit = public_exit }); eq(partial, git_process)
+  calls[1].opts.on_stdout(" M partial"); calls[1].opts.on_stdout("-name.php"); calls[1].on_exit(success_result())
+  eq(#calls, 1); eq(exit_count, 1); eq(exit_value.stderr, "incomplete git status record")
+  parser_failure("R  new.php\0", "incomplete rename or copy source record")
+  parser_failure("C  copied.php\0", "incomplete rename or copy source record")
+  parser_failure("R  new.php\0\0", "malformed rename or copy source path")
+  parser_failure("C  copied.php\0\0", "malformed rename or copy source path")
+
+  reset()
+  existing["/project/file.php"] = true
+  rsync_start_error = "rsync start failure"
+
+  local rsync_initial_process = git.upload("/project/current.php", {
+    on_exit = public_exit,
+  })
+
+  eq(rsync_initial_process, git_process)
+  eq(#calls, 1)
+  eq(exit_count, 0)
+
+  calls[1].opts.on_stdout(" M file.php\0")
+  calls[1].on_exit(success_result())
+
+  eq(#calls, 2)
+  eq(exit_count, 1)
+  eq(exit_value.stderr, "rsync start failure")
+  eq(exit_value.code, nil)
+  eq(exit_value.signal, nil)
+  eq(exit_value.stdout, "")
+  eq(exit_value.stdout_truncated, false)
+  eq(exit_value.stderr_truncated, false)
+  eq(exit_value.stdout_error, nil)
+  eq(exit_value.stderr_error, nil)
+  eq(exit_value.stdout_callback_error, nil)
+  eq(exit_value.stderr_callback_error, nil)
+
+  reset(); existing["/project/file.php"] = true
+  local held = git.upload("/project/current.php", { on_exit = public_exit }); eq(held, git_process)
+  calls[1].opts.on_stdout("M\0")
+  local precedence = success_result(); precedence.stdout_error = "stream failed"; calls[1].on_exit(precedence)
+  eq(exit_value.stderr, "stream failed"); eq(exit_value.stdout_error, "stream failed"); eq(#calls, 1)
+  reset(); local held2 = git.upload("/project/current.php", { on_exit = public_exit }); eq(held2, git_process)
+  calls[1].opts.on_stdout("M\0"); precedence = success_result(); precedence.stdout_callback_error = "callback failed"; calls[1].on_exit(precedence)
+  eq(exit_value.stderr, "callback failed"); eq(exit_value.stdout_callback_error, "callback failed"); eq(#calls, 1)
+
+  reset()
+
+  local precedence_exit_count = 0
+  local precedence_exit_value
+
+  local precedence_process = git.upload("/project/current.php", {
+    on_exit = function(result)
+      precedence_exit_count = precedence_exit_count + 1
+      precedence_exit_value = result
+    end,
+  })
+
+  eq(precedence_process, git_process)
+  eq(#calls, 1)
+
+  local nonzero_with_stream_error = success_result()
+  nonzero_with_stream_error.code = 1
+  nonzero_with_stream_error.stderr = "git failed"
+  nonzero_with_stream_error.stdout_error = "read failure"
+
+  calls[1].on_exit(nonzero_with_stream_error)
+
+  eq(#calls, 1)
+  eq(precedence_exit_count, 1)
+  eq(precedence_exit_value, nonzero_with_stream_error)
+
+  reset()
+
+  local parser_process = git.upload("/project/current.php", {
+    on_exit = public_exit,
+  })
+
+  eq(parser_process, git_process)
+  eq(#calls, 1)
+
+  calls[1].opts.on_stdout("M\0")
+  calls[1].on_exit(success_result())
+
+  eq(#calls, 1)
+  eq(exit_count, 1)
+  eq(exit_value.code, nil)
+  eq(exit_value.signal, nil)
+  eq(exit_value.stdout, "")
+  eq(exit_value.stderr, "malformed git status record")
+  eq(exit_value.stdout_truncated, false)
+  eq(exit_value.stderr_truncated, false)
+  eq(exit_value.stdout_error, nil)
+  eq(exit_value.stderr_error, nil)
+  eq(exit_value.stdout_callback_error, nil)
+  eq(exit_value.stderr_callback_error, nil)
+
+  local allowed_failure_fields = {
+    code = true,
+    signal = true,
+    stdout = true,
+    stderr = true,
+    stdout_truncated = true,
+    stderr_truncated = true,
+    stdout_error = true,
+    stderr_error = true,
+    stdout_callback_error = true,
+    stderr_callback_error = true,
+  }
+
+  for key in pairs(exit_value) do
+    check(allowed_failure_fields[key], "unexpected parser failure field: " .. tostring(key))
+  end
+
+  reset()
+
+  existing["/project/file.php"] = true
+  rsync_start_error = "rsync start failure"
+
+  local protected_exit_count = 0
+
+  local protected_process = git.upload("/project/current.php", {
+    on_exit = function()
+      protected_exit_count = protected_exit_count + 1
+      error("public rsync exit failure", 0)
+    end,
+  })
+
+  eq(protected_process, git_process)
+  eq(#calls, 1)
+
+  calls[1].opts.on_stdout(" M file.php\0")
+
+  local protected_ok, protected_error = pcall(function()
+    calls[1].on_exit(success_result())
+  end)
+
+  check(protected_ok, "rsync start failure escaped public on_exit: " .. tostring(protected_error))
+
+  eq(#calls, 2)
+  eq(protected_exit_count, 1)
+
+  reset()
+
+  existing["/project/file.php"] = true
+
+  local successful_exit_count = 0
+
+  local successful_process = git.upload("/project/current.php", {
+    on_exit = function()
+      successful_exit_count = successful_exit_count + 1
+    end,
+  })
+
+  eq(successful_process, git_process)
+  eq(#calls, 1)
+  eq(successful_exit_count, 0)
+
+  calls[1].opts.on_stdout(" M file.php\0")
+  calls[1].on_exit(success_result())
+
+  eq(#calls, 2)
+  eq(successful_exit_count, 0)
+  check(type(calls[2].on_exit) == "function")
+
+  calls[2].on_exit(success_result())
+
+  eq(successful_exit_count, 1)
+
+vim.uv.fs_stat = saved_stat
+package.loaded["remote-sync.config"] = saved_config
+package.loaded["remote-sync.runner"] = saved_runner
+package.loaded["remote-sync.git"] = saved_git
+end
+
 print("remote-sync tests: OK")
