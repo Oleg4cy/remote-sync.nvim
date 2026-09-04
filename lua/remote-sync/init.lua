@@ -147,6 +147,48 @@ local function start_error(title, err)
   return nil, message
 end
 
+local function validate_config_options(options)
+  if type(options) ~= "table" then
+    return nil, "config file must return a table"
+  end
+
+  for key in pairs(options) do
+    if key ~= "projects" then
+      return nil, "unknown setup option: " .. tostring(key)
+    end
+  end
+
+  return true
+end
+
+local function load_config_file(path)
+  if type(path) ~= "string" or not path:match("%S") then
+    return nil, "config must be a non-empty path"
+  end
+
+  local resolved_path = path
+  if vim.fn.isabsolutepath(path) == 0 then
+    resolved_path = vim.fn.stdpath("config") .. "/" .. path
+  end
+
+  local chunk, load_err = loadfile(resolved_path)
+  if not chunk then
+    return nil, "failed to load config file: " .. resolved_path .. ": " .. tostring(load_err)
+  end
+
+  local ok, loaded = pcall(chunk)
+  if not ok then
+    return nil, "error executing config file: " .. resolved_path .. ": " .. tostring(loaded)
+  end
+
+  local valid, validation_err = validate_config_options(loaded)
+  if not valid then
+    return nil, "invalid config file: " .. validation_err
+  end
+
+  return loaded
+end
+
 function M.setup(opts)
   if opts == nil then
     opts = {}
@@ -156,12 +198,24 @@ function M.setup(opts)
   end
 
   for key in pairs(opts) do
-    if key ~= "projects" then
+    if key ~= "projects" and key ~= "config" then
       return nil, "unknown setup option: " .. tostring(key)
     end
   end
 
+  if opts.projects ~= nil and opts.config ~= nil then
+    return nil, "projects and config cannot be used together"
+  end
+
   local projects = opts.projects
+  if opts.config ~= nil then
+    local loaded, load_err = load_config_file(opts.config)
+    if not loaded then
+      return nil, load_err
+    end
+    projects = loaded.projects
+  end
+
   if projects == nil then
     projects = {}
   end
