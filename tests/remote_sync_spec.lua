@@ -1385,7 +1385,11 @@ do
       arg_calls[#arg_calls + 1] = lhs
       return maparg[lhs] or ""
     end
-    local spec = load_with_fake_vim(repo_file("lazy.lua"), lazy_vim)
+    local package_specs = load_with_fake_vim(repo_file("lazy.lua"), lazy_vim)
+    assert(type(package_specs) == "table")
+    assert(#package_specs == 1)
+    local spec = package_specs[1]
+    assert(spec[1] == "Oleg4cy/remote-sync.nvim")
     assert(#spec.cmd == 3 and spec.cmd[1] == "SyncUpload" and spec.cmd[2] == "SyncDownload" and spec.cmd[3] == "SyncGitUpload")
     assert(type(spec.init) == "function")
     spec.init()
