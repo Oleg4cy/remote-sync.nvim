@@ -1445,4 +1445,150 @@ do
   package.loaded["remote-sync.plugin"] = saved_plugin
 end
 
+do
+  local remote_sync = require("remote-sync")
+  local config_module = require("remote-sync.config")
+  local original_loadfile = _G.loadfile
+  local original_set_projects = config_module.set_projects
+  local original_isabsolutepath = vim.fn.isabsolutepath
+  local original_stdpath = vim.fn.stdpath
+  local projects = {}
+  local set_calls, set_error, last_set_value, load_calls, chunk_calls = 0, nil, nil, {}, 0
+  local absolute_calls, stdpath_calls = {}, {}
+  local loaded_chunk
+
+  local function reset()
+    set_calls, last_set_value, load_calls, chunk_calls = 0, nil, {}, 0
+    absolute_calls, stdpath_calls = {}, {}
+  end
+
+  local function install(chunk, load_error)
+    loaded_chunk = chunk
+    _G.loadfile = function(path)
+      load_calls[#load_calls + 1] = path
+      if load_error then
+        return nil, load_error
+      end
+      return function()
+        chunk_calls = chunk_calls + 1
+        return loaded_chunk()
+      end
+    end
+  end
+
+  local function setup(opts)
+    reset()
+    return remote_sync.setup(opts)
+  end
+
+  vim.fn.isabsolutepath = function(path)
+    absolute_calls[#absolute_calls + 1] = path
+    return path:sub(1, 1) == "/" and 1 or 0
+  end
+  vim.fn.stdpath = function(kind)
+    stdpath_calls[#stdpath_calls + 1] = kind
+    return "/home/test/.config/nvim"
+  end
+	config_module.set_projects = function(value)
+		set_calls = set_calls + 1
+		last_set_value = value
+		if set_error ~= nil then
+			return nil, set_error
+		end
+		return true
+	end
+
+  local result, err = setup({ projects = projects })
+  assert(result == true and err == nil)
+  assert(set_calls == 1 and last_set_value == projects)
+  assert(#load_calls == 0 and #absolute_calls == 0 and #stdpath_calls == 0)
+
+  result, err = setup({ projects = {}, config = "remote-sync.lua" })
+  assert(result == nil and err == "projects and config cannot be used together")
+  assert(#load_calls == 0 and set_calls == 0)
+
+  for _, value in ipairs({ false, 123, {}, "", "   " }) do
+    result, err = setup({ config = value })
+    assert(result == nil and err == "config must be a non-empty path")
+    assert(#load_calls == 0 and set_calls == 0)
+  end
+
+  install(function() return { projects = projects } end)
+  result, err = setup({ config = "lua/config/remote-sync.lua" })
+  assert(result == true and err == nil)
+  assert(absolute_calls[1] == "lua/config/remote-sync.lua")
+  assert(stdpath_calls[1] == "config")
+  assert(load_calls[1] == "/home/test/.config/nvim/lua/config/remote-sync.lua")
+  assert(chunk_calls == 1 and set_calls == 1 and last_set_value == projects)
+
+  install(function() return { projects = projects } end)
+  result, err = setup({ config = "/tmp/remote-sync.lua" })
+  assert(result == true and err == nil)
+  assert(absolute_calls[1] == "/tmp/remote-sync.lua" and #stdpath_calls == 0)
+  assert(load_calls[1] == "/tmp/remote-sync.lua" and chunk_calls == 1 and set_calls == 1)
+  assert(last_set_value == projects)
+
+  install(function() return {} end)
+  result, err = setup({ config = "/tmp/remote-sync.lua" })
+  assert(result == true and err == nil and set_calls == 1 and chunk_calls == 1)
+  assert(type(last_set_value) == "table" and next(last_set_value) == nil)
+
+  local invalid_chunks = {
+    function() return nil end,
+    function() return false end,
+    function() return 123 end,
+    function() return "bad" end,
+    function() return function() end end,
+  }
+  for _, chunk in ipairs(invalid_chunks) do
+    install(chunk)
+    result, err = setup({ config = "/invalid/remote-sync.lua" })
+    assert(result == nil and err == "invalid config file: config file must return a table")
+    assert(set_calls == 0 and #load_calls == 1 and chunk_calls == 1)
+  end
+
+  install(function() return { unknown = true } end)
+  result, err = setup({ config = "/invalid/remote-sync.lua" })
+  assert(result == nil and err == "invalid config file: unknown setup option: unknown" and set_calls == 0)
+
+  install(function() return { config = "another.lua" } end)
+  result, err = setup({ config = "/invalid/remote-sync.lua" })
+  assert(result == nil and err == "invalid config file: unknown setup option: config")
+  assert(#load_calls == 1 and chunk_calls == 1 and set_calls == 0)
+
+  install(nil, "cannot open file")
+  result, err = setup({ config = "/missing/remote-sync.lua" })
+  assert(result == nil and err == "failed to load config file: /missing/remote-sync.lua: cannot open file")
+  assert(chunk_calls == 0 and set_calls == 0)
+
+  install(function() error("config runtime failure", 0) end)
+  result, err = setup({ config = "/broken/remote-sync.lua" })
+  assert(result == nil and err == "error executing config file: /broken/remote-sync.lua: config runtime failure")
+  assert(chunk_calls == 1 and set_calls == 0)
+
+  set_error = "config failure"
+  install(function() return { projects = projects } end)
+  result, err = setup({ config = "/tmp/remote-sync.lua" })
+  assert(result == nil and err == "config failure")
+  assert(#load_calls == 1 and chunk_calls == 1 and set_calls == 1)
+  assert(last_set_value == projects)
+
+  for _, key in ipairs({ "keymaps", "default_mappings", "arbitrary_unknown" }) do
+    result, err = setup({ [key] = true })
+    assert(result == nil and err == "unknown setup option: " .. key)
+    assert(#load_calls == 0 and set_calls == 0)
+  end
+
+  for _, value in ipairs({ false, 123, "bad" }) do
+    result, err = setup(value)
+    assert(result == nil)
+    assert(#load_calls == 0 and set_calls == 0)
+  end
+
+  _G.loadfile = original_loadfile
+  config_module.set_projects = original_set_projects
+  vim.fn.isabsolutepath = original_isabsolutepath
+  vim.fn.stdpath = original_stdpath
+end
+
 print("remote-sync tests: OK")
